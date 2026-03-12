@@ -709,7 +709,7 @@ impl QuickwitIncrementalAggregations {
 /// It defines the data that should be accumulated about the documents matching
 /// the query.
 #[derive(Clone)]
-pub(crate) struct QuickwitCollector {
+pub struct QuickwitCollector {
     pub split_id: SplitId,
     pub start_offset: usize,
     pub max_hits: usize,
@@ -1030,7 +1030,7 @@ pub(crate) fn sort_by_from_request(search_request: &SearchRequest) -> SortByPair
 }
 
 /// Builds the QuickwitCollector, in function of the information that was requested by the user.
-pub(crate) fn make_collector_for_split(
+pub fn make_collector_for_split(
     split_id: SplitId,
     search_request: &SearchRequest,
     aggregation_limits: AggregationLimitsGuard,

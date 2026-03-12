@@ -45,7 +45,10 @@ macro_rules! read_only_directory {
         }
 
         fn delete(&self, _path: &Path) -> Result<(), tantivy::directory::error::DeleteError> {
-            unimplemented!("read-only")
+            // For read-only directories (like BundleDirectory), deleting is a no-op.
+            // This is needed to support UnionDirectory merges where garbage collection
+            // tries to delete files from read-only source directories.
+            Ok(())
         }
 
         fn open_write(

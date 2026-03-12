@@ -37,6 +37,11 @@ mod search_response_rest;
 mod service;
 pub(crate) mod top_k_collector;
 
+// Export warmup for external use (vendored version)
+pub use collector::{QuickwitCollector, make_collector_for_split};
+
+pub use crate::leaf::warmup;
+
 mod metrics;
 mod search_permit_provider;
 

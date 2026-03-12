@@ -66,6 +66,10 @@ doc_mapping:
       type: text
       tokenizer: raw
       fast: true
+    - name: _scope
+      type: text
+      tokenizer: raw
+      fast: true
     - name: severity_text
       type: text
       tokenizer: raw
