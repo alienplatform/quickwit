@@ -1,0 +1,41 @@
+name: Search regressions
+
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: search-regressions-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  search:
+    name: Search and cursor regressions
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_BUILD_JOBS: "2"
+      QW_DISABLE_TELEMETRY: "1"
+    defaults:
+      run:
+        working-directory: quickwit
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly-2026-10-03
+        with:
+          components: rustfmt
+      - name: Install native dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libssl-dev pkg-config
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: quickwit
+      - uses: taiki-e/install-action@nextest
+      - name: Check formatting
+        run: cargo fmt -p quickwit-search -p quickwit-proto -- --check
+      - name: Test search and cursor behavior
+        run: cargo nextest run --release --locked -p quickwit-search -p quickwit-proto --features quickwit-search/testsuite
