@@ -37,6 +37,6 @@ jobs:
           workspaces: quickwit
       - uses: taiki-e/install-action@nextest
       - name: Check formatting
-        run: cargo fmt -p quickwit-search -p quickwit-proto -- --check
+        run: cargo +nightly-2026-10-03 fmt -p quickwit-search -p quickwit-proto -- --check
       - name: Test search and cursor behavior
-        run: cargo nextest run --release --locked -p quickwit-search -p quickwit-proto --features quickwit-search/testsuite
+        run: cargo +nightly-2026-10-03 nextest run --release --locked -p quickwit-search -p quickwit-proto --features quickwit-search/testsuite
