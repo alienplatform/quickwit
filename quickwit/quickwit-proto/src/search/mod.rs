@@ -112,6 +112,11 @@ impl SortByValue {
                     Some(SortValue::I64(number))
                 } else if let Ok(number) = value.parse::<u64>() {
                     Some(SortValue::U64(number))
+                } else if let Ok(number) = value.parse::<f64>() {
+                    if !number.is_finite() {
+                        return None;
+                    }
+                    Some(SortValue::F64(number))
                 } else {
                     return None;
                 }
@@ -291,7 +296,22 @@ fn read_split_fields_from_zstd<R: Read>(reader: R) -> io::Result<ListFields> {
 mod numeric_sort_tests {
     use std::cmp::Ordering;
 
-    use super::SortValue;
+    use super::{SortByValue, SortValue};
+
+    #[test]
+    fn numeric_cursor_strings_preserve_float_sign_and_reject_nonfinite_values() {
+        for value in [-0.0f64, 0.0, -1.5, f64::MIN_POSITIVE, f64::MAX] {
+            let decoded =
+                SortByValue::try_from_json(serde_json::json!(format!("{value:?}"))).unwrap();
+            let Some(SortValue::F64(actual)) = decoded.sort_value else {
+                panic!("floating cursor must retain its numeric domain");
+            };
+            assert_eq!(actual.to_bits(), value.to_bits());
+        }
+        for value in ["NaN", "inf", "-inf", "1e999", "not-a-number"] {
+            assert!(SortByValue::try_from_json(serde_json::json!(value)).is_none());
+        }
+    }
 
     #[test]
     fn mixed_numeric_order_preserves_integer_precision_and_transitivity() {
