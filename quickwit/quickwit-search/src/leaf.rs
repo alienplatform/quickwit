@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use bytesize::ByteSize;
 use futures::future::try_join_all;
+use quickwit_common::pretty::PrettySample;
 use quickwit_directories::{CachingDirectory, HotDirectory, StorageDirectory};
 use quickwit_doc_mapper::{Automaton, DocMapper, FastFieldWarmupInfo, TermRange, WarmupInfo};
 use quickwit_proto::search::{
@@ -824,7 +825,7 @@ impl RemoveTimestampRange<'_> {
         use quickwit_query::InterpretUserInput;
         let Some(lower_bound) = DateTime::interpret_json(lower_bound) else {
             // we shouldn't be able to get here, we would have errored much earlier in root search
-            warn!("unparsable lower time bound in leaf search");
+            warn!("unparsable time bound in leaf search: {lower_bound:?}");
             return;
         };
         let bound = if included {
@@ -840,7 +841,7 @@ impl RemoveTimestampRange<'_> {
         use quickwit_query::InterpretUserInput;
         let Some(upper_bound) = DateTime::interpret_json(upper_bound) else {
             // we shouldn't be able to get here, we would have errored much earlier in root search
-            warn!("unparsable upper time bound in leaf search");
+            warn!("unparsable time bound in leaf search: {upper_bound:?}");
             return;
         };
         let bound = if included {
@@ -1277,7 +1278,7 @@ fn disable_search_request_hits(search_request: &mut SearchRequest) {
 /// [PartialHit](quickwit_proto::search::PartialHit) candidates. The root will be in
 /// charge to consolidate, identify the actual final top hits to display, and
 /// fetch the actual documents to convert the partial hits into actual Hits.
-#[instrument(skip_all)]
+#[instrument(skip_all, fields(index = ?request.index_id_patterns))]
 pub async fn single_doc_mapping_leaf_search(
     searcher_context: Arc<SearcherContext>,
     request: Arc<SearchRequest>,
@@ -1292,7 +1293,7 @@ pub async fn single_doc_mapping_leaf_search(
     current_span.record("num_docs", num_docs);
     current_span.record("num_splits", num_splits);
 
-    info!(num_docs, num_splits);
+    info!(num_docs, num_splits, split_offsets = ?PrettySample::new(&splits, 5));
 
     let split_filter = CanSplitDoBetter::from_request(&request, doc_mapper.timestamp_field_name());
     let split_with_req = split_filter.optimize(request.clone(), splits)?;
@@ -1371,12 +1372,9 @@ pub async fn single_doc_mapping_leaf_search(
                 continue;
             }
             if join_error.is_panic() {
-                error!("leaf search task panicked");
+                error!(split=%split, "leaf search task panicked");
             } else {
-                error!(
-                    "please report: leaf search was not cancelled, and could not extract panic. \
-                     this should never happen"
-                );
+                error!(split=%split, "please report: leaf search was not cancelled, and could not extract panic. this should never happen");
             }
             split_search_join_errors.push((split, join_error));
         }
@@ -1396,13 +1394,9 @@ pub async fn single_doc_mapping_leaf_search(
         });
     }
 
-    let merge_permit = searcher_context.search_permit_provider.acquire_cpu().await;
     let leaf_search_response_reresult: Result<Result<LeafSearchResponse, _>, _> =
         crate::search_thread_pool()
-            .run_cpu_intensive(move || {
-                let _permit = merge_permit;
-                incremental_merge_collector.finalize()
-            })
+            .run_cpu_intensive(|| incremental_merge_collector.finalize())
             .instrument(info_span!("incremental_merge_intermediate"))
             .await
             .context("failed to merge split search responses");
@@ -1411,7 +1405,7 @@ pub async fn single_doc_mapping_leaf_search(
 }
 
 #[allow(clippy::too_many_arguments)]
-#[instrument(skip_all, fields(num_docs = split.num_docs))]
+#[instrument(skip_all, fields(split_id = split.split_id, num_docs = split.num_docs))]
 async fn leaf_search_single_split_wrapper(
     request: SearchRequest,
     searcher_context: Arc<SearcherContext>,

@@ -14,7 +14,7 @@
 
 use std::fmt;
 use std::ops::Range;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -29,13 +29,6 @@ use crate::{BulkDeleteError, OwnedBytes, Storage, StorageResult};
 pub struct StorageWithCache {
     pub storage: Arc<dyn Storage>,
     pub cache: Arc<dyn StorageCache>,
-}
-
-impl StorageWithCache {
-    fn cache_key(&self, path: &Path) -> PathBuf {
-        // Internal filenames can recur in different immutable bundle objects.
-        PathBuf::from(format!("{}/{}", self.storage.uri(), path.display()))
-    }
 }
 
 impl fmt::Debug for StorageWithCache {
@@ -63,12 +56,13 @@ impl Storage for StorageWithCache {
     }
 
     async fn get_slice(&self, path: &Path, byte_range: Range<usize>) -> StorageResult<OwnedBytes> {
-        let key = self.cache_key(path);
-        if let Some(bytes) = self.cache.get(&key, byte_range.clone()).await {
+        if let Some(bytes) = self.cache.get(path, byte_range.clone()).await {
             Ok(bytes)
         } else {
             let bytes = self.storage.get_slice(path, byte_range.clone()).await?;
-            self.cache.put(key, byte_range, bytes.clone()).await;
+            self.cache
+                .put(path.to_owned(), byte_range, bytes.clone())
+                .await;
             Ok(bytes)
         }
     }
@@ -85,12 +79,11 @@ impl Storage for StorageWithCache {
     }
 
     async fn get_all(&self, path: &Path) -> StorageResult<OwnedBytes> {
-        let key = self.cache_key(path);
-        if let Some(bytes) = self.cache.get_all(&key).await {
+        if let Some(bytes) = self.cache.get_all(path).await {
             Ok(bytes)
         } else {
             let bytes = self.storage.get_all(path).await?;
-            self.cache.put_all(key, bytes.clone()).await;
+            self.cache.put_all(path.to_owned(), bytes.clone()).await;
             Ok(bytes)
         }
     }
@@ -128,9 +121,6 @@ mod tests {
     #[tokio::test]
     async fn put_in_cache_test() {
         let mut mock_storage = MockStorage::default();
-        mock_storage
-            .expect_uri()
-            .return_const(Uri::for_test("ram:///synthetic"));
         let mut mock_cache = MockStorageCache::default();
         let actual_cache: Arc<Mutex<HashMap<PathBuf, OwnedBytes>>> =
             Arc::new(Mutex::new(HashMap::new()));

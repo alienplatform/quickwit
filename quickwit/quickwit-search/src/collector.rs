@@ -31,7 +31,7 @@ use tantivy::aggregation::{AggregationLimitsGuard, AggregationSegmentCollector};
 use tantivy::collector::{Collector, SegmentCollector};
 use tantivy::columnar::{ColumnType, MonotonicallyMappableToU64};
 use tantivy::fastfield::Column;
-use tantivy::{DateTime, DocId, Score, SegmentOrdinal, SegmentReader, TantivyError};
+use tantivy::{DocId, Score, SegmentOrdinal, SegmentReader, TantivyError};
 
 use crate::find_trace_ids_collector::{FindTraceIdsCollector, FindTraceIdsSegmentCollector, Span};
 use crate::top_k_collector::{QuickwitSegmentTopKCollector, specialized_top_k_segment_collector};
@@ -184,8 +184,8 @@ impl SortingFieldExtractorComponent {
     /// Converts u64 fast field values to its correct type.
     /// The conversion is delayed for performance reasons.
     ///
-    /// This is used to convert `search_after` sort value to a u64 representation that will respect
-    /// the same order as the `SortValue` representation.
+    /// Cursor comparisons also use this typed representation, so mixed numeric
+    /// schemas do not round cursor bounds into a different field type.
     pub fn convert_u64_ff_val_to_sort_value(&self, sort_value: u64) -> SortValue {
         let map_fast_field_to_value = |fast_field_value, field_type| match field_type {
             SortFieldType::U64 => SortValue::U64(fast_field_value),
@@ -200,173 +200,6 @@ impl SortingFieldExtractorComponent {
                 sort_field_type, ..
             } => map_fast_field_to_value(sort_value, *sort_field_type),
             SortingFieldExtractorComponent::Score => SortValue::F64(f64::from_u64(sort_value)),
-        }
-    }
-    /// Converts fast field values into their u64 fast field representation.
-    ///
-    /// Returns None if value is out of bounds of target value.
-    /// None means that the search_after will be disabled and everything matches.
-    ///
-    /// What's currently missing is to signal that _nothing_ matches to generate an optimized
-    /// query. For now we just choose the max value of the target type.
-    #[inline]
-    pub fn convert_to_u64_ff_val(
-        &self,
-        sort_value: SortValue,
-        sort_order: SortOrder,
-    ) -> Option<u64> {
-        match self {
-            SortingFieldExtractorComponent::DocId => match sort_value {
-                SortValue::U64(val) => Some(val),
-                _ => panic!("Internal error: Got non-U64 sort value for DocId."),
-            },
-            SortingFieldExtractorComponent::FastField {
-                sort_field_type, ..
-            } => {
-                // We need to convert a (potential user provided) value in the correct u64
-                // representation of the fast field.
-                // This requires this weird conversion of first casting into the target type
-                // (if possible) and then to its u64 presentation.
-                //
-                // For the conversion into the target type it's important to know if the target
-                // type does not cover the whole range of the source type. In that case we need to
-                // add additional conversion checks, to see if it matches everything
-                // or nothing. (Which also depends on the sort order).
-                // Below are the visual representations of the value ranges of the different types.
-                // Note: DateTime is equal to I64 and omitted.
-                //
-                //     Bool value range (0, 1):
-                //                        <->
-                //
-                //     I64 value range (signed 64-bit integer):
-                //     <------------------------------------>
-                //     -2^63                             2^63-1
-                //     U64 value range (unsigned 64-bit integer):
-                //                        <------------------------------------>
-                //                        0                                  2^64-1
-                // F64 value range (64-bit floating point, conceptual, not to scale):
-                // <-------------------------------------------------------------------->
-                // Very negative numbers                                       Very positive numbers
-                //
-                // Those conversions have limited target type value space:
-                // - [X] U64 -> I64
-                // - [X] F64 -> I64
-                // - [X] I64 -> U64
-                // - [X] F64 -> U64
-                //
-                // - [X] F64 -> Bool
-                // - [X] I64 -> Bool
-                // - [X] U64 -> Bool
-                //
-                let val = match (sort_value, sort_field_type) {
-                    // Same field type, no conversion needed.
-                    (SortValue::U64(val), SortFieldType::U64) => val,
-                    (SortValue::F64(val), SortFieldType::F64) => val.to_u64(),
-                    (SortValue::Boolean(val), SortFieldType::Bool) => val.to_u64(),
-                    (SortValue::I64(val), SortFieldType::I64) => val.to_u64(),
-                    (SortValue::U64(mut val), SortFieldType::I64) => {
-                        if sort_order == SortOrder::Desc && val > i64::MAX as u64 {
-                            return None;
-                        }
-                        // Add a limit to avoid overflow.
-                        val = val.min(i64::MAX as u64);
-                        (val as i64).to_u64()
-                    }
-                    (SortValue::U64(val), SortFieldType::F64) => (val as f64).to_u64(),
-                    (SortValue::U64(mut val), SortFieldType::DateTime) => {
-                        // Match everything
-                        if sort_order == SortOrder::Desc && val > i64::MAX as u64 {
-                            return None;
-                        }
-                        // Add a limit to avoid overflow.
-                        val = val.min(i64::MAX as u64);
-                        DateTime::from_timestamp_nanos(val as i64).to_u64()
-                    }
-                    (SortValue::I64(val), SortFieldType::U64) => {
-                        if val < 0 && sort_order == SortOrder::Asc {
-                            return None;
-                        }
-                        if val < 0 && sort_order == SortOrder::Desc {
-                            u64::MIN // matches nothing as search_after is not inclusive
-                        } else {
-                            val as u64
-                        }
-                    }
-                    (SortValue::I64(val), SortFieldType::F64) => (val as f64).to_u64(),
-                    (SortValue::I64(val), SortFieldType::DateTime) => {
-                        DateTime::from_timestamp_nanos(val).to_u64()
-                    }
-                    (SortValue::F64(val), SortFieldType::U64) => {
-                        let all_values_ahead1 =
-                            val < u64::MIN as f64 && sort_order == SortOrder::Asc;
-                        let all_values_ahead2 =
-                            val > u64::MAX as f64 && sort_order == SortOrder::Desc;
-                        if all_values_ahead1 || all_values_ahead2 {
-                            return None;
-                        }
-                        // f64 cast already handles under/overflow and clamps the value
-                        (val as u64).to_u64()
-                    }
-                    (SortValue::F64(val), SortFieldType::I64)
-                    | (SortValue::F64(val), SortFieldType::DateTime) => {
-                        let all_values_ahead1 =
-                            val < i64::MIN as f64 && sort_order == SortOrder::Asc;
-                        let all_values_ahead2 =
-                            val > i64::MAX as f64 && sort_order == SortOrder::Desc;
-                        if all_values_ahead1 || all_values_ahead2 {
-                            return None;
-                        }
-                        // f64 cast already handles under/overflow and clamps the value
-                        let val_i64 = val as i64;
-
-                        if *sort_field_type == SortFieldType::DateTime {
-                            DateTime::from_timestamp_nanos(val_i64).to_u64()
-                        } else {
-                            val_i64.to_u64()
-                        }
-                    }
-                    // Not sure when we hit this, it's probably are very rare case.
-                    (SortValue::Boolean(val), SortFieldType::U64) => val as u64,
-                    (SortValue::Boolean(val), SortFieldType::F64) => (val as u64 as f64).to_u64(),
-                    (SortValue::Boolean(val), SortFieldType::I64) => (val as i64).to_u64(),
-                    (SortValue::Boolean(val), SortFieldType::DateTime) => {
-                        DateTime::from_timestamp_nanos(val as i64).to_u64()
-                    }
-                    (SortValue::U64(mut val), SortFieldType::Bool) => {
-                        let all_values_ahead1 = val > 1 && sort_order == SortOrder::Desc;
-                        if all_values_ahead1 {
-                            return None;
-                        }
-                        // clamp value for comparison
-                        val = val.clamp(0, 1);
-                        (val == 1).to_u64()
-                    }
-                    (SortValue::I64(mut val), SortFieldType::Bool) => {
-                        let all_values_ahead1 = val > 1 && sort_order == SortOrder::Desc;
-                        let all_values_ahead2 = val < 0 && sort_order == SortOrder::Asc;
-                        if all_values_ahead1 || all_values_ahead2 {
-                            return None;
-                        }
-                        // clamp value for comparison
-                        val = val.clamp(0, 1);
-                        (val == 1).to_u64()
-                    }
-                    (SortValue::F64(mut val), SortFieldType::Bool) => {
-                        let all_values_ahead1 = val > 1.0 && sort_order == SortOrder::Desc;
-                        let all_values_ahead2 = val < 0.0 && sort_order == SortOrder::Asc;
-                        if all_values_ahead1 || all_values_ahead2 {
-                            return None;
-                        }
-                        val = val.clamp(0.0, 1.0);
-                        (val >= 0.5).to_u64() // Is this correct?
-                    }
-                };
-                Some(val)
-            }
-            SortingFieldExtractorComponent::Score => match sort_value {
-                SortValue::F64(val) => Some(val.to_u64()),
-                _ => panic!("Internal error: Got non-F64 sort value for Score."),
-            },
         }
     }
 }
@@ -1052,7 +885,7 @@ pub fn make_collector_for_split(
 }
 
 /// Builds a QuickwitCollector that's only useful for merging fruits.
-pub fn make_merge_collector(
+pub(crate) fn make_merge_collector(
     search_request: &SearchRequest,
     aggregation_limits: &AggregationLimitsGuard,
 ) -> crate::Result<QuickwitCollector> {

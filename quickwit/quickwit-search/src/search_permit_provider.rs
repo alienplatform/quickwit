@@ -14,7 +14,6 @@
 
 use std::collections::VecDeque;
 use std::future::Future;
-use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -27,15 +26,13 @@ use tokio::sync::{mpsc, oneshot};
 
 /// Distributor of permits to perform split search operation.
 ///
-/// Requests use FIFO admission by default, or round-robin batch admission with
-/// an active-search limit. Each permit initially reserves a slot for the
+/// Requests are served in order. Each permit initially reserves a slot for the
 /// warmup (limit concurrent downloads) and a pessimistic amount of memory. Once
 /// the warmup is completed, the actual memory usage is set and the warmup slot
 /// is released. Once the search is completed and the permit is dropped, the
 /// remaining memory is also released.
 #[derive(Clone)]
 pub struct SearchPermitProvider {
-    limits_active_searches: bool,
     message_sender: mpsc::UnboundedSender<SearchPermitMessage>,
     #[cfg(test)]
     actor_stopped: watch::Receiver<bool>,
@@ -82,27 +79,7 @@ pub fn compute_initial_memory_allocation(
 }
 
 impl SearchPermitProvider {
-    /// Creates memory-aware admission with a limit on concurrent downloads.
     pub fn new(num_download_slots: usize, memory_budget: ByteSize) -> Self {
-        Self::create(num_download_slots, memory_budget, None)
-    }
-
-    /// Bounds active split tasks through CPU completion, including cached searches
-    /// with zero newly warmed bytes and tasks whose parent request was cancelled.
-    /// Live request batches share admission in round-robin order.
-    pub fn with_max_active_searches(
-        num_download_slots: usize,
-        memory_budget: ByteSize,
-        max_active_searches: NonZeroUsize,
-    ) -> Self {
-        Self::create(num_download_slots, memory_budget, Some(max_active_searches))
-    }
-
-    fn create(
-        num_download_slots: usize,
-        memory_budget: ByteSize,
-        max_active_searches: Option<NonZeroUsize>,
-    ) -> Self {
         let (message_sender, message_receiver) = mpsc::unbounded_channel();
         #[cfg(test)]
         let (state_sender, state_receiver) = watch::channel(false);
@@ -110,7 +87,6 @@ impl SearchPermitProvider {
             msg_receiver: message_receiver,
             msg_sender: message_sender.downgrade(),
             num_warmup_slots_available: num_download_slots,
-            num_active_slots_available: max_active_searches.map(NonZeroUsize::get),
             total_memory_budget: memory_budget.as_u64(),
             permits_requests: VecDeque::new(),
             total_memory_allocated: 0u64,
@@ -119,35 +95,17 @@ impl SearchPermitProvider {
         };
         tokio::spawn(actor.run());
         Self {
-            limits_active_searches: max_active_searches.is_some(),
             message_sender,
             #[cfg(test)]
             actor_stopped: state_receiver,
         }
     }
 
-    // Keep CPU-only finalization in the opt-in active-task budget without
-    // changing default upstream warmup admission.
-    pub(crate) async fn acquire_cpu(&self) -> Option<SearchPermit> {
-        if !self.limits_active_searches {
-            return None;
-        }
-        let mut permit = self
-            .get_permits([ByteSize::b(0)])
-            .await
-            .pop()
-            .expect("one requested permit is always returned")
-            .await;
-        permit.free_warmup_slot();
-        Some(permit)
-    }
-
     /// Returns one permit future for each provided split metadata.
     ///
     /// The permits returned are guaranteed to be resolved in order. In
-    /// addition, the default provider resolves a batch before subsequent batches.
-    /// With an active-search limit, live batches instead share admission in
-    /// round-robin order, preserving order within each batch.
+    /// addition, the permits are guaranteed to be resolved before permits
+    /// returned by subsequent calls to this function.
     ///
     /// The permit memory size is capped by per_permit_initial_memory_allocation.
     pub async fn get_permits(
@@ -172,13 +130,12 @@ struct SearchPermitActor {
     msg_receiver: mpsc::UnboundedReceiver<SearchPermitMessage>,
     msg_sender: mpsc::WeakUnboundedSender<SearchPermitMessage>,
     num_warmup_slots_available: usize,
-    num_active_slots_available: Option<usize>,
     /// Note it is possible for memory_allocated to exceed memory_budget temporarily,
     /// if and only if a split leaf search task ended up using more than `initial_allocation`.
     /// When it happens, new permits will not be assigned until the memory is freed.
     total_memory_budget: u64,
     total_memory_allocated: u64,
-    permits_requests: VecDeque<VecDeque<(oneshot::Sender<SearchPermit>, u64)>>,
+    permits_requests: VecDeque<(oneshot::Sender<SearchPermit>, u64)>,
     #[cfg(test)]
     stopped: watch::Sender<bool>,
 }
@@ -199,23 +156,11 @@ impl SearchPermitActor {
                 permit_sizes,
                 permit_sender,
             } => {
-                if permit_sender.is_closed() {
-                    return;
-                }
-                // A live waiter at the front must not retain cancelled batches behind it.
-                self.permits_requests.retain_mut(|batch| {
-                    batch.retain(|(sender, _)| !sender.is_closed());
-                    !batch.is_empty()
-                });
                 let mut permits = Vec::with_capacity(permit_sizes.len());
-                let mut batch = VecDeque::with_capacity(permit_sizes.len());
                 for permit_size in permit_sizes {
                     let (tx, rx) = oneshot::channel();
-                    batch.push_back((tx, permit_size));
+                    self.permits_requests.push_back((tx, permit_size));
                     permits.push(SearchPermitFuture(rx));
-                }
-                if !batch.is_empty() {
-                    self.permits_requests.push_back(batch);
                 }
                 self.assign_available_permits();
                 // The receiver could be dropped in the (unlikely) situation
@@ -242,9 +187,6 @@ impl SearchPermitActor {
                 if !warmup_slot_freed {
                     self.num_warmup_slots_available += 1;
                 }
-                if let Some(available) = &mut self.num_active_slots_available {
-                    *available += 1;
-                }
                 self.total_memory_allocated = self
                     .total_memory_allocated
                     .checked_sub(memory_size)
@@ -255,30 +197,13 @@ impl SearchPermitActor {
     }
 
     fn pop_next_request_if_serviceable(&mut self) -> Option<(oneshot::Sender<SearchPermit>, u64)> {
-        // Drop cancelled front waiters even while CPU capacity is exhausted.
-        while let Some(batch) = self.permits_requests.front_mut() {
-            while batch.front().is_some_and(|(sender, _)| sender.is_closed()) {
-                batch.pop_front();
-            }
-            if !batch.is_empty() {
-                break;
-            }
-            self.permits_requests.pop_front();
-        }
-        if self.num_warmup_slots_available == 0 || self.num_active_slots_available == Some(0) {
+        if self.num_warmup_slots_available == 0 {
             return None;
         }
-        if let Some(batch) = self.permits_requests.front_mut()
-            && let Some((_, next_permit_size)) = batch.front()
+        if let Some((_, next_permit_size)) = self.permits_requests.front()
             && self.total_memory_allocated + next_permit_size <= self.total_memory_budget
         {
-            let next = batch.pop_front();
-            if batch.is_empty() {
-                self.permits_requests.pop_front();
-            } else if self.num_active_slots_available.is_some() {
-                self.permits_requests.rotate_left(1);
-            }
-            return next;
+            return self.permits_requests.pop_front();
         }
         None
     }
@@ -293,9 +218,6 @@ impl SearchPermitActor {
             ongoing_gauge_guard.add(1);
             self.total_memory_allocated += next_permit_size;
             self.num_warmup_slots_available -= 1;
-            if let Some(available) = &mut self.num_active_slots_available {
-                *available -= 1;
-            }
             permit_requester_tx
                 .send(SearchPermit {
                     _ongoing_gauge_guard: ongoing_gauge_guard,
@@ -309,12 +231,7 @@ impl SearchPermitActor {
         }
         crate::SEARCH_METRICS
             .leaf_search_single_split_tasks_pending
-            .set(
-                self.permits_requests
-                    .iter()
-                    .map(VecDeque::len)
-                    .sum::<usize>() as i64,
-            );
+            .set(self.permits_requests.len() as i64);
     }
 }
 
@@ -397,83 +314,6 @@ mod tests {
     use tokio::task::JoinSet;
 
     use super::*;
-
-    #[tokio::test]
-    async fn bounded_batches_share_admission_without_waiting_for_an_entire_request() {
-        let provider = SearchPermitProvider::with_max_active_searches(
-            1,
-            ByteSize::mb(1),
-            NonZeroUsize::new(1).unwrap(),
-        );
-        let mut large = provider.get_permits([ByteSize::b(1); 8]).await.into_iter();
-        let active = large.next().unwrap().await;
-        let small = provider
-            .get_permits([ByteSize::b(1)])
-            .await
-            .into_iter()
-            .next()
-            .unwrap();
-        drop(active);
-        // One already-queued batch can win the next slot, but must then yield
-        // to another live request instead of draining all its split waiters.
-        let next_large = large.next().unwrap().await;
-        drop(next_large);
-        assert!(provider.get_permits([]).await.is_empty());
-        tokio::pin!(small);
-        assert!(
-            futures::poll!(&mut small).is_ready(),
-            "a smaller request is starved behind an entire batch"
-        );
-    }
-
-    #[tokio::test]
-    async fn active_limit_survives_cached_warmup_and_cancelled_waiters() {
-        let provider = SearchPermitProvider::with_max_active_searches(
-            1,
-            ByteSize::mb(1),
-            NonZeroUsize::new(1).unwrap(),
-        );
-        let mut batch = provider
-            .get_permits([ByteSize::b(1), ByteSize::b(1)])
-            .await
-            .into_iter();
-        let mut active = batch.next().unwrap().await;
-        active.update_memory_usage(ByteSize::b(0));
-        active.free_warmup_slot();
-        // This round trip ensures both updates were processed before polling.
-        assert!(provider.get_permits([]).await.is_empty());
-        let waiting = batch.next().unwrap();
-        tokio::pin!(waiting);
-        assert!(futures::poll!(&mut waiting).is_pending());
-        for _ in 0..4 {
-            drop(provider.get_permits([ByteSize::b(0); 16]).await);
-        }
-        assert!(provider.get_permits([]).await.is_empty());
-        assert_eq!(
-            crate::SEARCH_METRICS
-                .leaf_search_single_split_tasks_pending
-                .get(),
-            1
-        );
-        drop(active);
-        let next = tokio::time::timeout(Duration::from_secs(1), waiting)
-            .await
-            .expect("completion must release the active slot");
-        drop(next);
-        assert!(provider.get_permits([]).await.is_empty());
-        assert_eq!(
-            crate::SEARCH_METRICS
-                .leaf_search_single_split_tasks_pending
-                .get(),
-            0
-        );
-        assert_eq!(
-            crate::SEARCH_METRICS
-                .leaf_search_single_split_tasks_ongoing
-                .get(),
-            0
-        );
-    }
 
     #[tokio::test]
     async fn test_search_permit_order() {

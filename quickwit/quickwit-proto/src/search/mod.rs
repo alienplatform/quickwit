@@ -129,6 +129,19 @@ impl SortByValue {
 // implementation. if in presence of NaN.
 impl Eq for SortValue {}
 
+// Casting the integer to f64 first makes equality non-transitive above 2^53.
+// All supported integers fit in i128; saturating float conversion also orders
+// infinities and finite out-of-range values outside the integer domain.
+fn compare_float_integer(left: f64, right: i128) -> Ordering {
+    if left.is_nan() {
+        return left.total_cmp(&(right as f64));
+    }
+    let truncated = left as i128;
+    truncated
+        .cmp(&right)
+        .then_with(|| left.total_cmp(&(truncated as f64)))
+}
+
 impl Ord for SortValue {
     #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
@@ -147,8 +160,12 @@ impl Ord for SortValue {
                 (left as i64).cmp(&right)
             }
             (SortValue::F64(left), SortValue::F64(right)) => left.total_cmp(&right),
-            (SortValue::F64(left), SortValue::U64(right)) => left.total_cmp(&(right as f64)),
-            (SortValue::F64(left), SortValue::I64(right)) => left.total_cmp(&(right as f64)),
+            (SortValue::F64(left), SortValue::U64(right)) => {
+                compare_float_integer(left, right as i128)
+            }
+            (SortValue::F64(left), SortValue::I64(right)) => {
+                compare_float_integer(left, right as i128)
+            }
             (SortValue::Boolean(left), right) => SortValue::U64(left as u64).cmp(&right),
             (left, right) => right.cmp(&left).reverse(),
         }
@@ -268,4 +285,44 @@ fn read_split_fields_from_zstd<R: Read>(reader: R) -> io::Result<ListFields> {
     let serialized_list_fields: ListFields = prost::Message::decode(&all_bytes[..])?;
 
     Ok(serialized_list_fields)
+}
+
+#[cfg(test)]
+mod numeric_sort_tests {
+    use std::cmp::Ordering;
+
+    use super::SortValue;
+
+    #[test]
+    fn mixed_numeric_order_preserves_integer_precision_and_transitivity() {
+        use SortValue::{F64, I64, U64};
+        let ordered = [
+            F64(f64::NEG_INFINITY),
+            I64(i64::MIN),
+            F64(-1.5),
+            I64(-1),
+            F64(-0.0),
+            U64(0),
+            F64(0.5),
+            U64(1),
+            F64(9_007_199_254_740_992.0),
+            U64(9_007_199_254_740_993),
+            F64(9_007_199_254_740_994.0),
+            U64(9_007_199_254_740_995),
+            I64(i64::MAX),
+            F64(9_223_372_036_854_775_808.0),
+            U64(u64::MAX),
+            F64(18_446_744_073_709_551_616.0),
+            F64(f64::INFINITY),
+        ];
+        for (index, left) in ordered.iter().enumerate() {
+            for right in &ordered[index + 1..] {
+                assert_eq!(left.cmp(right), Ordering::Less, "{left:?} < {right:?}");
+                assert_eq!(right.cmp(left), Ordering::Greater);
+            }
+        }
+        assert_eq!(F64(0.0).cmp(&U64(0)), Ordering::Equal);
+        assert_eq!(F64(i64::MIN as f64).cmp(&I64(i64::MIN)), Ordering::Equal);
+        assert_eq!(F64(f64::NAN).cmp(&U64(u64::MAX)), Ordering::Greater);
+    }
 }

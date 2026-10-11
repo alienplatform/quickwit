@@ -1056,8 +1056,7 @@ fn finalize_aggregation(
     Ok(Some(merge_aggregation_result))
 }
 
-/// Finalize merged intermediate aggregations using the context's shared limits.
-pub fn finalize_aggregation_if_any(
+fn finalize_aggregation_if_any(
     search_request: &SearchRequest,
     intermediate_aggregation_result_bytes_opt: Option<Vec<u8>>,
     searcher_context: &SearcherContext,

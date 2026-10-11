@@ -17,7 +17,7 @@ use std::fmt::Debug;
 use std::marker::PhantomData;
 
 use quickwit_common::binary_heap::TopK;
-use quickwit_proto::search::{PartialHit, SortOrder};
+use quickwit_proto::search::{PartialHit, SortOrder, SortValue};
 use quickwit_proto::types::SplitId;
 use tantivy::{DocId, Score};
 
@@ -639,8 +639,7 @@ impl GenericQuickwitSegmentTopKCollector {
             // This value isn't actually used.
             _ => Ordering::Equal,
         };
-        let search_after =
-            SearchAfterSegment::new(search_after_option, order1, order2, &score_extractor);
+        let search_after = SearchAfterSegment::new(search_after_option);
 
         GenericQuickwitSegmentTopKCollector {
             split_id,
@@ -668,20 +667,32 @@ impl GenericQuickwitSegmentTopKCollector {
         sort_value: Option<u64>,
         sort_value2: Option<u64>,
         search_after: &Option<SearchAfterSegment>,
+        score_extractor: &SortingFieldExtractorPair,
         precomp_search_after_order: Ordering,
         top_k_hits: &mut TopK<SegmentPartialHit, SegmentPartialHitSortingKey, HitSortingMapper>,
     ) {
         if let Some(search_after) = &search_after {
             let search_after_value1 = search_after.sort_value;
             let search_after_value2 = search_after.sort_value2;
+            let typed_value1 = sort_value.map(|value| {
+                score_extractor
+                    .first
+                    .convert_u64_ff_val_to_sort_value(value)
+            });
+            let typed_value2 = sort_value2.and_then(|value| {
+                score_extractor
+                    .second
+                    .as_ref()
+                    .map(|extractor| extractor.convert_u64_ff_val_to_sort_value(value))
+            });
             let orders = &top_k_hits.sort_key_mapper;
             let mut cmp_result = orders
                 .order1
-                .compare_opt(&sort_value, &search_after_value1)
+                .compare_opt(&typed_value1, &search_after_value1)
                 .then_with(|| {
                     orders
                         .order2
-                        .compare_opt(&sort_value2, &search_after_value2)
+                        .compare_opt(&typed_value2, &search_after_value2)
                 });
             if search_after.compare_on_equal {
                 // TODO actually it's not first, it should be what's in _shard_doc then first then
@@ -727,6 +738,7 @@ impl QuickwitSegmentTopKCollector for GenericQuickwitSegmentTopKCollector {
                     sort_value,
                     sort_value2,
                     &self.search_after,
+                    &self.score_extractor,
                     self.precomp_search_after_order,
                     &mut self.top_k_hits,
                 );
@@ -795,6 +807,7 @@ impl QuickwitSegmentTopKCollector for GenericQuickwitSegmentTopKCollector {
             sort_value,
             sort_value2,
             &self.search_after,
+            &self.score_extractor,
             self.precomp_search_after_order,
             &mut self.top_k_hits,
         );
@@ -817,55 +830,20 @@ impl QuickwitSegmentTopKCollector for GenericQuickwitSegmentTopKCollector {
     }
 }
 
-/// Search After, but the sort values are converted to the u64 fast field representation.
+/// Preserve the cursor's numeric domain across heterogeneous split schemas.
+/// Rounding into a segment's fast-field type can skip or repeat boundary hits.
 pub(crate) struct SearchAfterSegment {
-    sort_value: Option<u64>,
-    sort_value2: Option<u64>,
+    sort_value: Option<SortValue>,
+    sort_value2: Option<SortValue>,
     compare_on_equal: bool,
     doc_id: DocId,
 }
 impl SearchAfterSegment {
-    pub fn new(
-        search_after_opt: Option<PartialHit>,
-        sort_order1: SortOrder,
-        sort_order2: SortOrder,
-        score_extractor: &SortingFieldExtractorPair,
-    ) -> Option<Self> {
+    pub fn new(search_after_opt: Option<PartialHit>) -> Option<Self> {
         let search_after = search_after_opt?;
-        let mut sort_value = None;
-        if let Some(search_after_sort_value) = search_after
-            .sort_value
-            .and_then(|sort_value| sort_value.sort_value)
-        {
-            if let Some(new_value) = score_extractor
-                .first
-                .convert_to_u64_ff_val(search_after_sort_value, sort_order1)
-            {
-                sort_value = Some(new_value);
-            } else {
-                // Value is out of bounds, we ignore sort_value2 and disable the whole
-                // search_after
-                return None;
-            }
-        }
-        let mut sort_value2 = None;
-        if let Some(search_after_sort_value) = search_after
-            .sort_value2
-            .and_then(|sort_value2| sort_value2.sort_value)
-        {
-            let extractor = score_extractor
-                .second
-                .as_ref()
-                .expect("Internal error: Got sort_value2, but no sort extractor");
-            if let Some(new_value) =
-                extractor.convert_to_u64_ff_val(search_after_sort_value, sort_order2)
-            {
-                sort_value2 = Some(new_value);
-            }
-        }
         Some(Self {
-            sort_value,
-            sort_value2,
+            sort_value: search_after.sort_value.and_then(|value| value.sort_value),
+            sort_value2: search_after.sort_value2.and_then(|value| value.sort_value),
             compare_on_equal: !search_after.split_id.is_empty(),
             doc_id: search_after.doc_id,
         })

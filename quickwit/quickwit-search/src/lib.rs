@@ -38,13 +38,12 @@ mod service;
 pub(crate) mod top_k_collector;
 
 // Export warmup for external use (vendored version)
-pub use collector::{QuickwitCollector, make_collector_for_split, make_merge_collector};
+pub use collector::{QuickwitCollector, make_collector_for_split};
 
-pub use crate::leaf::{single_doc_mapping_leaf_search, warmup};
+pub use crate::leaf::warmup;
 
 mod metrics;
 mod search_permit_provider;
-pub use search_permit_provider::SearchPermitProvider;
 
 #[cfg(test)]
 mod tests;
@@ -85,10 +84,10 @@ pub use crate::client::{
 };
 pub use crate::cluster_client::ClusterClient;
 pub use crate::error::{SearchError, parse_grpc_error};
-pub use crate::fetch_docs::fetch_docs;
+use crate::fetch_docs::fetch_docs;
 pub use crate::root::{
-    IndexMetasForLeafSearch, SearchJob, check_all_index_metadata_found,
-    finalize_aggregation_if_any, jobs_to_leaf_request, root_search, search_plan, validate_request,
+    IndexMetasForLeafSearch, SearchJob, check_all_index_metadata_found, jobs_to_leaf_request,
+    root_search, search_plan, validate_request,
 };
 pub use crate::search_job_placer::{Job, SearchJobPlacer};
 pub use crate::search_response_rest::{
@@ -99,8 +98,7 @@ pub use crate::service::{MockSearchService, SearchService, SearchServiceImpl};
 /// A pool of searcher clients identified by their gRPC socket address.
 pub type SearcherPool = Pool<SocketAddr, SearchServiceClient>;
 
-/// Shared bounded CPU executor used by leaf search, merging and document retrieval.
-pub fn search_thread_pool() -> &'static ThreadPool {
+fn search_thread_pool() -> &'static ThreadPool {
     static SEARCH_THREAD_POOL: OnceLock<ThreadPool> = OnceLock::new();
     SEARCH_THREAD_POOL.get_or_init(|| ThreadPool::new("search", None))
 }
