@@ -112,7 +112,10 @@ impl SortByValue {
                     Some(SortValue::I64(number))
                 } else if let Ok(number) = value.parse::<u64>() {
                     Some(SortValue::U64(number))
-                } else if let Ok(number) = value.parse::<f64>() {
+                } else if value.contains(['.', 'e', 'E']) {
+                    // An overflowing integer string must not silently round into
+                    // a float. Floating cursor encodings identify their domain.
+                    let number = value.parse::<f64>().ok()?;
                     if !number.is_finite() {
                         return None;
                     }
@@ -308,7 +311,15 @@ mod numeric_sort_tests {
             };
             assert_eq!(actual.to_bits(), value.to_bits());
         }
-        for value in ["NaN", "inf", "-inf", "1e999", "not-a-number"] {
+        for value in [
+            "NaN",
+            "inf",
+            "-inf",
+            "1e999",
+            "not-a-number",
+            "18446744073709551616",
+            "-9223372036854775809",
+        ] {
             assert!(SortByValue::try_from_json(serde_json::json!(value)).is_none());
         }
     }
