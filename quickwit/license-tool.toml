@@ -5,3 +5,11 @@
 
 # `ring` has a custom license that is mostly "ISC-style" but parts of it also fall under OpenSSL licensing.
 "ring-0.17.8" = { license = "ISC AND Custom" }
+
+# Older dependency versions use license files instead of SPDX metadata.
+# ring's LICENSE covers ISC, OpenSSL-derived and third-party code.
+"ring-0.16.20" = { license = "ISC AND Custom" }
+# LICENSE is ISC; third-party/chromium/LICENSE is BSD-3-Clause.
+"rustls-webpki-0.100.3" = { license = "ISC AND BSD-3-Clause" }
+# This proc-macro crate is part of the rust-openssl repository.
+"openssl-macros-0.1.1" = { origin = "https://github.com/sfackler/rust-openssl" }

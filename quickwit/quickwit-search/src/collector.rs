@@ -543,16 +543,22 @@ impl QuickwitIncrementalAggregations {
 /// the query.
 #[derive(Clone)]
 pub struct QuickwitCollector {
+    /// Split identifier attached to collected document addresses.
     pub split_id: SplitId,
+    /// Number of sorted hits to skip in the final result.
     pub start_offset: usize,
+    /// Maximum number of hits to return after the offset.
     pub max_hits: usize,
-    pub sort_by: SortByPair,
+    pub(crate) sort_by: SortByPair,
+    /// Optional aggregation collected alongside matching hits.
     pub aggregation: Option<QuickwitAggregations>,
+    /// Shared memory and bucket limits for aggregation collectors.
     pub aggregation_limits: AggregationLimitsGuard,
     search_after: Option<PartialHit>,
 }
 
 impl QuickwitCollector {
+    /// Whether the request only counts matches, without hits or aggregations.
     pub fn is_count_only(&self) -> bool {
         self.max_hits == 0 && self.aggregation.is_none()
     }
@@ -565,6 +571,7 @@ impl QuickwitCollector {
         self.start_offset = search_request.start_offset as usize;
         self.search_after.clone_from(&search_request.search_after);
     }
+    /// Fast fields required by sorting and aggregations.
     pub fn fast_field_names(&self) -> HashSet<String> {
         let mut fast_field_names = HashSet::default();
         self.sort_by.first.add_fast_field(&mut fast_field_names);
@@ -577,6 +584,7 @@ impl QuickwitCollector {
         fast_field_names
     }
 
+    /// Data to warm before running this collector.
     pub fn warmup_info(&self) -> WarmupInfo {
         WarmupInfo {
             fast_fields: self
