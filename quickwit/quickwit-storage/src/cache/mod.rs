@@ -31,13 +31,8 @@ pub use self::byte_range_cache::ByteRangeCache;
 pub use self::memory_sized_cache::MemorySizedCache;
 use crate::{OwnedBytes, Storage};
 
-/// Wraps the given directory with a slice cache that is actually global
-/// to quickwit.
-///
-/// FIXME The current approach is quite horrible in that:
-/// - it uses a global
-/// - it relies on the idea that all of the files we attempt to cache have universally unique names.
-///   It happens to be true today, but this might be very error prone in the future.
+/// Wraps storage with a shared slice cache. Keys include the storage URI so
+/// immutable objects with identical internal filenames remain isolated.
 pub fn wrap_storage_with_cache(
     long_term_cache: Arc<dyn StorageCache>,
     storage: Arc<dyn Storage>,

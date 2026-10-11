@@ -41,6 +41,7 @@ pub struct BundleStorage {
     storage: Arc<dyn Storage>,
     /// The file path of the bundle in the storage.
     bundle_filepath: PathBuf,
+    uri: Uri,
     metadata: BundleStorageFileOffsets,
 }
 
@@ -74,11 +75,13 @@ impl BundleStorage {
         split_data: FileSlice,
     ) -> anyhow::Result<(FileSlice, Self)> {
         let (hotcache, metadata) = BundleStorageFileOffsets::open_from_split_data(split_data)?;
+        let uri = storage.uri().join(&bundle_filepath)?;
         Ok((
             hotcache,
             BundleStorage {
                 storage,
                 bundle_filepath,
+                uri,
                 metadata,
             },
         ))
@@ -283,7 +286,7 @@ impl Storage for BundleStorage {
     }
 
     fn uri(&self) -> &Uri {
-        self.storage.uri()
+        &self.uri
     }
 }
 
@@ -315,7 +318,62 @@ mod tests {
     use std::io::Write;
 
     use super::*;
-    use crate::{PutPayload, RamStorageBuilder, SplitPayloadBuilder};
+    use crate::{
+        PutPayload, QuickwitCache, RamStorageBuilder, SplitPayloadBuilder, wrap_storage_with_cache,
+    };
+
+    #[tokio::test]
+    async fn shared_cache_separates_same_named_files_in_different_bundles() -> anyhow::Result<()> {
+        for suffix in ["fast", "term", "idx", "pos", "store"] {
+            let temporary = tempfile::tempdir()?;
+            let internal = temporary.path().join(format!("shared.{suffix}"));
+            let mut buffers = Vec::new();
+            for value in [7u8, 19] {
+                fs::write(&internal, [value; 16])?;
+                buffers.push(
+                    SplitPayloadBuilder::get_split_payload(&[internal.clone()], &[], &[])?
+                        .read_all()
+                        .await?,
+                );
+            }
+            let storage = Arc::new(
+                RamStorageBuilder::default()
+                    .put("first.split", &buffers[0])
+                    .put("second.split", &buffers[1])
+                    .build(),
+            );
+            let cache = Arc::new(QuickwitCache::all_files(64));
+            let mut bundles = Vec::new();
+            for (index, name) in ["first.split", "second.split"].into_iter().enumerate() {
+                let (_, bundle) = BundleStorage::open_from_split_data(
+                    storage.clone(),
+                    PathBuf::from(name),
+                    FileSlice::from(buffers[index].to_vec()),
+                )?;
+                bundles.push(wrap_storage_with_cache(cache.clone(), Arc::new(bundle)));
+            }
+            let filename = format!("shared.{suffix}");
+            let path = Path::new(&filename);
+            for (bundle, expected) in bundles.iter().zip([7u8, 19]) {
+                assert_eq!(bundle.get_all(path).await?.as_slice(), &[expected; 16]);
+                assert_eq!(
+                    bundle.get_slice(path, 4..12).await?.as_slice(),
+                    &[expected; 8]
+                );
+            }
+            // Confirm the second pass reads cached bytes, not the backing objects.
+            storage.delete(Path::new("first.split")).await?;
+            storage.delete(Path::new("second.split")).await?;
+            for (bundle, expected) in bundles.iter().zip([7u8, 19]) {
+                assert_eq!(bundle.get_all(path).await?.as_slice(), &[expected; 16]);
+                assert_eq!(
+                    bundle.get_slice(path, 4..12).await?.as_slice(),
+                    &[expected; 8]
+                );
+            }
+        }
+        Ok(())
+    }
 
     #[tokio::test]
     async fn bundle_storage_file_offsets() -> anyhow::Result<()> {
@@ -347,6 +405,7 @@ mod tests {
             .build();
 
         let bundle_storage = BundleStorage {
+            uri: ram_storage.uri().join(&bundle_filepath)?,
             metadata,
             bundle_filepath: bundle_filepath.to_path_buf(),
             storage: Arc::new(ram_storage),
@@ -389,6 +448,7 @@ mod tests {
             .build();
 
         let bundle_storage = BundleStorage {
+            uri: ram_storage.uri().join(&bundle_filepath)?,
             metadata,
             bundle_filepath: bundle_filepath.to_path_buf(),
             storage: Arc::new(ram_storage),
@@ -423,6 +483,7 @@ mod tests {
             .put(&bundle_filepath.to_string_lossy(), &buffer)
             .build();
         let bundle_storage = BundleStorage {
+            uri: ram_storage.uri().join(&bundle_filepath)?,
             metadata,
             bundle_filepath,
             storage: Arc::new(ram_storage),

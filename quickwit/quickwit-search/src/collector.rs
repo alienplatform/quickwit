@@ -1052,7 +1052,7 @@ pub fn make_collector_for_split(
 }
 
 /// Builds a QuickwitCollector that's only useful for merging fruits.
-pub(crate) fn make_merge_collector(
+pub fn make_merge_collector(
     search_request: &SearchRequest,
     aggregation_limits: &AggregationLimitsGuard,
 ) -> crate::Result<QuickwitCollector> {

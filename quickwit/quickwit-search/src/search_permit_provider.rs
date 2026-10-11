@@ -14,6 +14,7 @@
 
 use std::collections::VecDeque;
 use std::future::Future;
+use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -79,7 +80,26 @@ pub fn compute_initial_memory_allocation(
 }
 
 impl SearchPermitProvider {
+    /// Creates memory-aware admission with a limit on concurrent downloads.
     pub fn new(num_download_slots: usize, memory_budget: ByteSize) -> Self {
+        Self::create(num_download_slots, memory_budget, None)
+    }
+
+    /// Bounds active split tasks through CPU completion, including cached searches
+    /// with zero newly warmed bytes and tasks whose parent request was cancelled.
+    pub fn with_max_active_searches(
+        num_download_slots: usize,
+        memory_budget: ByteSize,
+        max_active_searches: NonZeroUsize,
+    ) -> Self {
+        Self::create(num_download_slots, memory_budget, Some(max_active_searches))
+    }
+
+    fn create(
+        num_download_slots: usize,
+        memory_budget: ByteSize,
+        max_active_searches: Option<NonZeroUsize>,
+    ) -> Self {
         let (message_sender, message_receiver) = mpsc::unbounded_channel();
         #[cfg(test)]
         let (state_sender, state_receiver) = watch::channel(false);
@@ -87,6 +107,7 @@ impl SearchPermitProvider {
             msg_receiver: message_receiver,
             msg_sender: message_sender.downgrade(),
             num_warmup_slots_available: num_download_slots,
+            num_active_slots_available: max_active_searches.map(NonZeroUsize::get),
             total_memory_budget: memory_budget.as_u64(),
             permits_requests: VecDeque::new(),
             total_memory_allocated: 0u64,
@@ -130,6 +151,7 @@ struct SearchPermitActor {
     msg_receiver: mpsc::UnboundedReceiver<SearchPermitMessage>,
     msg_sender: mpsc::WeakUnboundedSender<SearchPermitMessage>,
     num_warmup_slots_available: usize,
+    num_active_slots_available: Option<usize>,
     /// Note it is possible for memory_allocated to exceed memory_budget temporarily,
     /// if and only if a split leaf search task ended up using more than `initial_allocation`.
     /// When it happens, new permits will not be assigned until the memory is freed.
@@ -156,6 +178,12 @@ impl SearchPermitActor {
                 permit_sizes,
                 permit_sender,
             } => {
+                if permit_sender.is_closed() {
+                    return;
+                }
+                // A live waiter at the front must not retain cancelled batches behind it.
+                self.permits_requests
+                    .retain(|(sender, _)| !sender.is_closed());
                 let mut permits = Vec::with_capacity(permit_sizes.len());
                 for permit_size in permit_sizes {
                     let (tx, rx) = oneshot::channel();
@@ -187,6 +215,9 @@ impl SearchPermitActor {
                 if !warmup_slot_freed {
                     self.num_warmup_slots_available += 1;
                 }
+                if let Some(available) = &mut self.num_active_slots_available {
+                    *available += 1;
+                }
                 self.total_memory_allocated = self
                     .total_memory_allocated
                     .checked_sub(memory_size)
@@ -197,7 +228,15 @@ impl SearchPermitActor {
     }
 
     fn pop_next_request_if_serviceable(&mut self) -> Option<(oneshot::Sender<SearchPermit>, u64)> {
-        if self.num_warmup_slots_available == 0 {
+        // Cancelled waiters must not accumulate while CPU capacity is exhausted.
+        while self
+            .permits_requests
+            .front()
+            .is_some_and(|(sender, _)| sender.is_closed())
+        {
+            self.permits_requests.pop_front();
+        }
+        if self.num_warmup_slots_available == 0 || self.num_active_slots_available == Some(0) {
             return None;
         }
         if let Some((_, next_permit_size)) = self.permits_requests.front()
@@ -218,6 +257,9 @@ impl SearchPermitActor {
             ongoing_gauge_guard.add(1);
             self.total_memory_allocated += next_permit_size;
             self.num_warmup_slots_available -= 1;
+            if let Some(available) = &mut self.num_active_slots_available {
+                *available -= 1;
+            }
             permit_requester_tx
                 .send(SearchPermit {
                     _ongoing_gauge_guard: ongoing_gauge_guard,
@@ -314,6 +356,55 @@ mod tests {
     use tokio::task::JoinSet;
 
     use super::*;
+
+    #[tokio::test]
+    async fn active_limit_survives_cached_warmup_and_cancelled_waiters() {
+        let provider = SearchPermitProvider::with_max_active_searches(
+            1,
+            ByteSize::mb(1),
+            NonZeroUsize::new(1).unwrap(),
+        );
+        let mut batch = provider
+            .get_permits([ByteSize::b(1), ByteSize::b(1)])
+            .await
+            .into_iter();
+        let mut active = batch.next().unwrap().await;
+        active.update_memory_usage(ByteSize::b(0));
+        active.free_warmup_slot();
+        // This round trip ensures both updates were processed before polling.
+        assert!(provider.get_permits([]).await.is_empty());
+        let waiting = batch.next().unwrap();
+        tokio::pin!(waiting);
+        assert!(futures::poll!(&mut waiting).is_pending());
+        for _ in 0..4 {
+            drop(provider.get_permits([ByteSize::b(0); 16]).await);
+        }
+        assert!(provider.get_permits([]).await.is_empty());
+        assert_eq!(
+            crate::SEARCH_METRICS
+                .leaf_search_single_split_tasks_pending
+                .get(),
+            1
+        );
+        drop(active);
+        let next = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("completion must release the active slot");
+        drop(next);
+        assert!(provider.get_permits([]).await.is_empty());
+        assert_eq!(
+            crate::SEARCH_METRICS
+                .leaf_search_single_split_tasks_pending
+                .get(),
+            0
+        );
+        assert_eq!(
+            crate::SEARCH_METRICS
+                .leaf_search_single_split_tasks_ongoing
+                .get(),
+            0
+        );
+    }
 
     #[tokio::test]
     async fn test_search_permit_order() {

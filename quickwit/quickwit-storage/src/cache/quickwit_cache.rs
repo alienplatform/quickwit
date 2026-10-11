@@ -40,13 +40,22 @@ impl QuickwitCache {
     /// Creates a [`QuickwitCache`] with a cache on fast fields
     /// with a capacity of `fast_field_cache_capacity`.
     pub fn new(fast_field_cache_capacity: usize) -> Self {
+        Self::with_suffix(fast_field_cache_capacity, ".fast")
+    }
+
+    /// Caches ranges from all immutable files under one shared byte budget.
+    pub fn all_files(capacity: usize) -> Self {
+        Self::with_suffix(capacity, "")
+    }
+
+    fn with_suffix(capacity: usize, suffix: &'static str) -> Self {
         let mut quickwit_cache = QuickwitCache::empty();
         let fast_field_cache_counters: &'static CacheMetrics =
             &crate::STORAGE_METRICS.fast_field_cache;
         quickwit_cache.add_route(
-            ".fast",
+            suffix,
             Arc::new(SimpleCache::with_capacity_in_bytes(
-                fast_field_cache_capacity,
+                capacity,
                 fast_field_cache_counters,
             )),
         );

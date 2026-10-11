@@ -371,7 +371,8 @@ fn simplify_search_request_for_scroll_api(req: &SearchRequest) -> crate::Result<
 
 /// Validates sort fields and search after values.
 /// - validate sort fields length.
-/// - search after values must be set for all sort fields.
+/// - search after slots must be present for all sort fields; null values require a document address
+///   to resume within missing values.
 fn validate_sort_by_fields_and_search_after(
     sort_fields: &[SortField],
     search_after: &Option<PartialHit>,
@@ -406,13 +407,17 @@ fn validate_sort_by_fields_and_search_after(
     // TODO: we could validate if the search after sort value types of consistent with the sort
     // field types.
     if let Some(sort_by_value) = search_after_partial_hit.sort_value.as_ref() {
-        sort_by_value.sort_value.context("sort value must be set")?;
+        if search_after_partial_hit.split_id.is_empty() {
+            sort_by_value.sort_value.context("sort value must be set")?;
+        }
         search_after_sort_value_count += 1;
     }
     if let Some(sort_by_value_2) = search_after_partial_hit.sort_value2.as_ref() {
-        sort_by_value_2
-            .sort_value
-            .context("sort value must be set")?;
+        if search_after_partial_hit.split_id.is_empty() {
+            sort_by_value_2
+                .sort_value
+                .context("sort value must be set")?;
+        }
         search_after_sort_value_count += 1;
     }
     if search_after_sort_value_count != sort_fields_without_doc_count {
@@ -491,11 +496,18 @@ fn check_is_fast_field(
     Ok(())
 }
 
-fn validate_request(
+/// Validate request limits, sort fields, aggregations, snippets and timestamp configuration.
+/// Query AST validation remains the caller's responsibility.
+pub fn validate_request(
     schema: &Schema,
     timestamp_field_name: &Option<&str>,
     search_request: &SearchRequest,
 ) -> crate::Result<()> {
+    validate_sort_by_fields_and_search_after(
+        &search_request.sort_fields,
+        &search_request.search_after,
+    )?;
+    validate_sort_field_types(schema, &search_request.sort_fields, &mut HashMap::new())?;
     if timestamp_field_name.is_none()
         && (search_request.start_timestamp.is_some() || search_request.end_timestamp.is_some())
     {
@@ -1044,7 +1056,8 @@ fn finalize_aggregation(
     Ok(Some(merge_aggregation_result))
 }
 
-fn finalize_aggregation_if_any(
+/// Finalize merged intermediate aggregations using the context's shared limits.
+pub fn finalize_aggregation_if_any(
     search_request: &SearchRequest,
     intermediate_aggregation_result_bytes_opt: Option<Vec<u8>>,
     searcher_context: &SearcherContext,
@@ -2246,6 +2259,23 @@ mod tests {
             },
         ];
         validate_sort_by_fields_and_search_after(&sort_fields, &None).unwrap();
+    }
+
+    #[test]
+    fn test_search_after_missing_value_requires_document_address() {
+        let sort_fields = vec![SortField {
+            field_name: "optional_value".to_string(),
+            ..Default::default()
+        }];
+        let mut cursor = PartialHit {
+            sort_value: Some(SortByValue { sort_value: None }),
+            ..Default::default()
+        };
+        assert!(
+            validate_sort_by_fields_and_search_after(&sort_fields, &Some(cursor.clone())).is_err()
+        );
+        cursor.split_id = "synthetic-split".to_string();
+        validate_sort_by_fields_and_search_after(&sort_fields, &Some(cursor)).unwrap();
     }
 
     #[test]
