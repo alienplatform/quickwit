@@ -28,7 +28,7 @@ use tantivy::schema::document::CompactDocValue;
 use tantivy::schema::{Document as DocumentTrait, Field, TantivyDocument, Value};
 use tantivy::snippet::SnippetGenerator;
 use tantivy::{ReloadPolicy, Score, Searcher, Term};
-use tracing::{Instrument, error};
+use tracing::Instrument;
 
 use crate::leaf::open_index_with_caches;
 use crate::service::SearcherContext;
@@ -62,35 +62,51 @@ async fn fetch_docs_to_map(
     {
         let global_doc_addrs: Vec<GlobalDocAddress> =
             global_doc_addrs.into_iter().cloned().collect();
-        let split_and_offset = split_offsets_map
+        let split_and_offset = *split_offsets_map
             .get(split_id)
             .ok_or_else(|| anyhow::anyhow!("failed to find offset for split {}", split_id))?;
-        split_fetch_docs_futures.push(fetch_docs_in_split(
-            searcher_context.clone(),
-            global_doc_addrs,
-            index_storage.clone(),
-            split_and_offset,
-            doc_mapper.clone(),
-            snippet_request_opt,
-        ));
+        let context = searcher_context.clone();
+        let storage = index_storage.clone();
+        let mapper = doc_mapper.clone();
+        split_fetch_docs_futures.push(async move {
+            if let Some(semaphore) = &context.fetch_docs_semaphore {
+                let permit = semaphore.clone().acquire_owned().await?;
+                let split = (*split_and_offset).clone();
+                let snippet = snippet_request_opt.cloned();
+                // An admitted group must finish its current decompression before
+                // releasing admission, even if the parent request is cancelled.
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    fetch_docs_in_split(
+                        context,
+                        global_doc_addrs,
+                        storage,
+                        &split,
+                        mapper,
+                        snippet.as_ref(),
+                    )
+                    .await
+                })
+                .await
+                .context("document fetch task failed")?
+            } else {
+                fetch_docs_in_split(
+                    context,
+                    global_doc_addrs,
+                    storage,
+                    split_and_offset,
+                    mapper,
+                    snippet_request_opt,
+                )
+                .await
+            }
+        });
     }
 
-    let split_fetch_docs: Vec<Vec<(GlobalDocAddress, Document)>> = futures::future::try_join_all(
-        split_fetch_docs_futures,
-    )
-    .await
-    .map_err(|error| {
-        let split_ids = splits
-            .iter()
-            .map(|split| split.split_id.clone())
-            .collect_vec();
-        error!(split_ids = ?split_ids, error = ?error, "error when fetching docs in splits");
-        anyhow::anyhow!(
-            "error when fetching docs for splits {:?}: {:?}",
-            split_ids,
-            error
-        )
-    })?;
+    let split_fetch_docs: Vec<Vec<(GlobalDocAddress, Document)>> =
+        futures::future::try_join_all(split_fetch_docs_futures)
+            .await
+            .context("failed to fetch requested documents")?;
 
     let global_doc_addr_to_doc_json: HashMap<GlobalDocAddress, Document> = split_fetch_docs
         .into_iter()
@@ -166,6 +182,11 @@ async fn fetch_docs_in_split(
     doc_mapper: Arc<DocMapper>,
     snippet_request_opt: Option<&SnippetRequest>,
 ) -> anyhow::Result<Vec<(GlobalDocAddress, Document)>> {
+    let concurrency = if searcher_context.fetch_docs_semaphore.is_some() {
+        1
+    } else {
+        NUM_CONCURRENT_REQUESTS
+    };
     global_doc_addrs.sort_by_key(|doc| doc.doc_addr);
     // Opens the index without the ephemeral unbounded cache, this cache is indeed not useful
     // when fetching docs as we will fetch them only once.
@@ -187,7 +208,7 @@ async fn fetch_docs_in_split(
     let index_reader = index
         .reader_builder()
         // the docs are presorted so a cache size of NUM_CONCURRENT_REQUESTS is fine
-        .doc_store_cache_num_blocks(NUM_CONCURRENT_REQUESTS)
+        .doc_store_cache_num_blocks(concurrency)
         .reload_policy(ReloadPolicy::Manual)
         .try_into()?;
     let searcher = Arc::new(index_reader.searcher());
@@ -252,7 +273,7 @@ async fn fetch_docs_in_split(
     });
 
     futures::stream::iter(doc_futures)
-        .buffer_unordered(NUM_CONCURRENT_REQUESTS)
+        .buffer_unordered(concurrency)
         .try_collect::<Vec<_>>()
         .await
 }

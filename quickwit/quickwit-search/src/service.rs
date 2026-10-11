@@ -403,6 +403,10 @@ pub struct SearcherContext {
     pub fast_fields_cache: Arc<dyn StorageCache>,
     /// Counting semaphore to limit concurrent leaf search split requests.
     pub search_permit_provider: SearchPermitProvider,
+    /// Optional shared admission for document-fetch split groups. Each admitted
+    /// group fetches sequentially and retains admission through CPU completion,
+    /// even when its caller is cancelled. None preserves default fetch behavior.
+    pub fetch_docs_semaphore: Option<Arc<tokio::sync::Semaphore>>,
     /// Split footer cache.
     pub split_footer_cache: MemorySizedCache<String>,
     /// Recent sub-query cache.
@@ -457,6 +461,7 @@ impl SearcherContext {
             searcher_config,
             fast_fields_cache: storage_long_term_cache,
             search_permit_provider: leaf_search_split_semaphore,
+            fetch_docs_semaphore: None,
             split_footer_cache: global_split_footer_cache,
             leaf_search_cache,
             list_fields_cache,
