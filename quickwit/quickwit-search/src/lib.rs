@@ -87,7 +87,7 @@ pub use crate::error::{SearchError, parse_grpc_error};
 use crate::fetch_docs::fetch_docs;
 pub use crate::root::{
     IndexMetasForLeafSearch, SearchJob, check_all_index_metadata_found, jobs_to_leaf_request,
-    root_search, search_plan,
+    root_search, search_plan, validate_request,
 };
 pub use crate::search_job_placer::{Job, SearchJobPlacer};
 pub use crate::search_response_rest::{

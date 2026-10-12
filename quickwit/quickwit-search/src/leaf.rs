@@ -204,7 +204,6 @@ pub(crate) async fn open_index_with_caches(
 /// to be hit.
 #[instrument(skip_all)]
 pub async fn warmup(searcher: &Searcher, warmup_info: &WarmupInfo) -> anyhow::Result<()> {
-    debug!(warmup_info=?warmup_info);
     let warm_up_terms_future = warm_up_terms(searcher, &warmup_info.terms_grouped_by_field)
         .instrument(debug_span!("warm_up_terms"));
     let warm_up_term_ranges_future =
