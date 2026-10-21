@@ -16,6 +16,7 @@ use aws_config::retry::RetryConfig;
 use aws_config::stalled_stream_protection::StalledStreamProtectionConfig;
 use aws_config::{BehaviorVersion, Region};
 pub use aws_smithy_async::rt::sleep::TokioSleep;
+use aws_smithy_http_client::tls::{self, rustls_provider::CryptoMode};
 use tokio::sync::OnceCell;
 
 pub mod error;
@@ -30,6 +31,15 @@ pub async fn get_aws_config() -> &'static aws_config::SdkConfig {
     SDK_CONFIG
         .get_or_init(|| async {
             aws_config::defaults(aws_behavior_version())
+                // Set the HTTPS client explicitly: for behavior versions older than
+                // `v2026_01_12` the SDK otherwise picks the legacy hyper 0.14 /
+                // rustls 0.21 connector. Credential providers and every client built
+                // from this config share it.
+                .http_client(
+                    aws_smithy_http_client::Builder::new()
+                        .tls_provider(tls::Provider::Rustls(CryptoMode::AwsLc))
+                        .build_https(),
+                )
                 .stalled_stream_protection(StalledStreamProtectionConfig::enabled().build())
                 // Currently handle this ourselves so probably best for now to leave it as is.
                 .retry_config(RetryConfig::disabled())
