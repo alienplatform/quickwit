@@ -143,6 +143,8 @@ pub async fn create_s3_client(s3_storage_config: &S3StorageConfig) -> S3Client {
     s3_config.set_sleep_impl(aws_config.sleep_impl());
     s3_config.set_stalled_stream_protection(aws_config.stalled_stream_protection());
     s3_config.set_timeout_config(aws_config.timeout_config().cloned());
+    s3_config.set_request_checksum_calculation(aws_config.request_checksum_calculation());
+    s3_config.set_response_checksum_validation(aws_config.response_checksum_validation());
 
     if let Some(endpoint) = s3_storage_config.endpoint() {
         info!(endpoint=%endpoint, "using S3 endpoint defined in storage config or environment variable");
@@ -1230,5 +1232,57 @@ mod tests {
             .put(Path::new("my-path"), Box::new(vec![1, 2, 3]))
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_s3_compatible_storage_put_split_payload_with_default_checksums() {
+        // A split payload streams its files as one body of unknown size; the default
+        // request checksum must still be computed for it.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("split-file");
+        std::fs::write(&file_path, b"split file content").unwrap();
+        let payload =
+            crate::SplitPayloadBuilder::get_split_payload(&[file_path], b"fields", b"hotcache")
+                .unwrap();
+        let payload_len = crate::PutPayload::len(&payload);
+
+        let client = StaticReplayClient::new(vec![ReplayEvent::new(
+            http::Request::builder().body(SdkBody::empty()).unwrap(),
+            http::Response::builder()
+                .status(200)
+                .body(SdkBody::empty())
+                .unwrap(),
+        )]);
+        let credentials = Credentials::new("mock_key", "mock_secret", None, None, "mock_provider");
+        let config = aws_sdk_s3::Config::builder()
+            .behavior_version(aws_behavior_version())
+            .region(Some(Region::new("Foo")))
+            .http_client(client.clone())
+            .credentials_provider(credentials)
+            .build();
+        let s3_storage = S3CompatibleObjectStorage {
+            s3_client: S3Client::from_conf(config),
+            uri: Uri::for_test("s3://bucket/indexes"),
+            bucket: "bucket".to_string(),
+            prefix: PathBuf::new(),
+            multipart_policy: MultiPartPolicy::default(),
+            retry_params: RetryParams::for_test(),
+            disable_multi_object_delete: false,
+            disable_multipart_upload: false,
+        };
+        s3_storage
+            .put(Path::new("my-split"), Box::new(payload))
+            .await
+            .unwrap();
+
+        let requests = client.actual_requests().collect::<Vec<_>>();
+        assert_eq!(requests.len(), 1);
+        let headers = requests[0].headers();
+        assert_eq!(headers.get("content-encoding"), Some("aws-chunked"));
+        assert_eq!(
+            headers.get("x-amz-decoded-content-length"),
+            Some(payload_len.to_string().as_str())
+        );
+        assert_eq!(headers.get("x-amz-trailer"), Some("x-amz-checksum-crc32"));
     }
 }
